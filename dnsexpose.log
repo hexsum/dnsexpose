@@ -1,0 +1,39 @@
+2015/11/24 18:29:43 [warn] [webserver] Mojolicious::Plugin::AccessLog::VERSION = 0.010
+2015/11/24 18:30:28 [warn] [webserver] Mojolicious::Plugin::AccessLog::VERSION = 0.010
+2015/11/24 18:30:28 [info] [webserver] Listening at "http://*:8888"
+2015/11/24 18:30:28 [info] [webserver] Manager 27860 started
+2015/11/24 18:30:28 [info] [webserver] Creating process id file "/home/wangpf/git/dnsexpose/hypnotoad.pid"
+2015/11/24 18:30:28 [debug] [webserver] Worker 27862 started
+2015/11/24 18:30:28 [debug] [webserver] Worker 27863 started
+2015/11/24 18:30:28 [debug] [webserver] Worker 27861 started
+2015/11/24 18:30:28 [debug] [webserver] Worker 27865 started
+2015/11/24 18:30:28 [debug] [webserver] Worker 27864 started
+2015/11/24 18:30:34 [debug] [webserver] Worker 27861 stopped
+2015/11/24 18:30:34 [debug] [webserver] Worker 27862 stopped
+2015/11/24 18:30:34 [debug] [webserver] Worker 27863 stopped
+2015/11/24 18:30:34 [debug] [webserver] Worker 27864 stopped
+2015/11/24 18:30:34 [debug] [webserver] Worker 27865 stopped
+2015/11/24 18:30:45 [warn] [webserver] Mojolicious::Plugin::AccessLog::VERSION = 0.010
+2015/11/24 18:30:45 [info] [webserver] Listening at "http://*:8888"
+2015/11/24 18:30:45 [info] [webserver] Manager 27867 started
+2015/11/24 18:30:45 [info] [webserver] Creating process id file "/home/wangpf/git/dnsexpose/hypnotoad.pid"
+2015/11/24 18:30:45 [debug] [webserver] Worker 27868 started
+2015/11/24 18:30:45 [debug] [webserver] Worker 27870 started
+2015/11/24 18:30:45 [debug] [webserver] Worker 27871 started
+2015/11/24 18:30:45 [debug] [webserver] Worker 27869 started
+2015/11/24 18:30:45 [debug] [webserver] Worker 27872 started
+2015/11/24 18:30:46 [info] [nameserver] 58.217.249.132 query tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:46 [info] [nameserver] 58.217.249.132 refused tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:48 [info] [nameserver] 222.73.134.16 query tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:48 [info] [nameserver] 222.73.134.16 refused tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:49 [info] [nameserver] 58.220.1.79 query tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:49 [info] [nameserver] 58.220.1.79 refused tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:51 [info] [nameserver] 183.61.13.176 query tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:51 [info] [nameserver] 183.61.13.176 refused tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:51 [info] [nameserver] 58.220.1.82 query tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:30:51 [info] [nameserver] 58.220.1.82 refused tools.dnsexpose.perfi.wang IN A
+2015/11/24 18:31:44 [debug] [webserver] Worker 27868 stopped
+2015/11/24 18:31:44 [debug] [webserver] Worker 27869 stopped
+2015/11/24 18:31:44 [debug] [webserver] Worker 27870 stopped
+2015/11/24 18:31:44 [debug] [webserver] Worker 27871 stopped
+2015/11/24 18:31:44 [debug] [webserver] Worker 27872 stopped

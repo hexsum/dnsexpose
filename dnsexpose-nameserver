@@ -1,0 +1,186 @@
+use strict;
+use warnings;
+use POSIX qw(strftime);
+use Sys::HostIP qw(ips);
+use Net::DNS::Nameserver;
+use Algorithm::ConsistentHash::CHash;
+use Redis::Fast;
+#use List::Util::XS qw(shuffle);
+#use Data::GUID qw(guid_string);
+use Data::Random::String ();
+use Mojolicious::Lite;
+my $log = app->log;
+$log->format(sub{
+    my ($time, $level, @lines) = @_;
+    return join ('\n',map {strftime("%Y/%m/%d %H:%M:%S",localtime()) . " [$level] $_"} @lines) . "\n";
+});
+my $config = plugin Config => {file => $ARGV[0] // $ENV{MOJO_CONFIG} // './dnsexpose.conf'};
+$log->level($config->{log_level} // 'info',);
+if(defined $config->{log_path}){
+    if(open my $file,">>",$config->{log_path} ){$log->path($config->{log_path});$log->handle($file);}
+    else{die "Can't open log file $config->{log_path}: $!\n";}
+}
+my %redis_pool;
+my @redis_servers = @{$config->{redis}{server}} or die "redis server must be set\n";
+my $auth_domain = $config->{nameserver}{auth_domain} or die "auth_domain must be set\n";
+my $api_domain = 'tools.' . $auth_domain;
+my $auth_email = $config->{nameserver}{auth_email} // 'admin@' . $auth_domain;
+my @bind_ips = ref $config->{nameserver}{bind_ip} eq "ARRAY"? @{$config->{nameserver}{bind_ip}}: @{ips()};
+my @nameservers = grep {$_ ne '127.0.0.1' and $_ ne '::1' and $_ !~/^(10\.|172\.16\.|172\.17\.|192\.168\.)/} @bind_ips;
+my $redis_selector = Algorithm::ConsistentHash::CHash->new(ids=>[@redis_servers],replicas=>1000);
+
+my $workers = $config->{nameserver}{workers} // 3;
+my $guid_length = $config->{guid_length} // 5;
+my $random_string_length = $config->{random_string_length} // 7;
+my $cname_count_max = $config->{nameserver}{cname_count} // 3;
+my $redis_namespace = $config->{redis}{namespace} // 'dnsexpose::';
+my $redis_expire = $config->{redis}{expire} // 60;
+
+sub dns_reply_handler {
+    my ($qname, $qclass, $qtype, $peerhost,$query,$conn) = @_;
+    my ($rcode, @ans, @auth, @add);
+    
+    $log->info("[nameserver] $peerhost query $qname $qclass $qtype");
+    
+    #my $ends_client_subnet;
+    #use Socket qw(inet_ntoa);
+    #if($query->header->arcount > 0){
+    #    my @additional = $query->additional;
+    #    for (@additional){
+    #        if($_->type eq 'OPT'){
+    #            my $client_subnet = $query->edns->option("CLIENT-SUBNET");
+    #            if(defined $client_subnet){
+    #                my($family,$source_netmask,$scope_netmask,$addr) = unpack "n1C1C1a4",$client_subnet;
+    #                $addr .= "\x0" x (4-length($addr)) if length($addr)<4;
+    #                $addr = inet_ntoa($addr);
+    #                $ends_client_subnet_info = "EDNS-CLIENT-SUBNET $addr/$source_netmask" ;
+    #            }
+    #        }
+    #    }
+    #}
+    if($qtype eq 'A' and $qname eq $api_domain){
+        for (@nameservers){
+            my ($ttl, $rdata) = (600, $_);
+            my $rr = new Net::DNS::RR("$qname $ttl $qclass $qtype $rdata");
+            my $add_rr = new Net::DNS::RR("ns1.$auth_domain 3600 IN A $_");
+            push @ans, $rr;
+            push @add,$add_rr;
+        }
+        @auth = (new Net::DNS::RR("$qname 600 IN NS ns1.$auth_domain"));
+        $rcode = "NOERROR";
+        $log->info("[nameserver] $peerhost answer $qname $qclass $qtype " . join ",",@nameservers);
+    }
+    elsif($qtype eq 'A' and $qname eq 'whoami.' . $auth_domain){
+        #my $guid = lc(guid_string);
+        #$guid=~s/-//g;
+        #$guid = substr($guid,0,$guid_length);
+        my $guid = lc Data::Random::String->create_random_string(length=>$guid_length,contains=>'alphanumeric');
+        my $random_string = lc Data::Random::String->create_random_string(length=>$random_string_length,contains=>'alphanumeric') . 'd3' ;
+        my ($ttl, $rdata) = (0, $random_string . $guid . '.' . $auth_domain);
+        @ans = ( new Net::DNS::RR("$qname $ttl $qclass CNAME $rdata") );
+        $rcode = "NOERROR";
+        $log->info("[nameserver] $peerhost answer $qname $qclass $qtype $rdata");
+    }
+    elsif($qtype eq 'A' and $qname =~ /([a-z0-9]{$random_string_length})([ad])(\d)([a-z0-9]{$guid_length})\.\Q$auth_domain\E/ ){
+        my ($random_string,$mode,$cname_count,$guid) = ($1,$2,$3,$4);
+        if( ( $mode ne 'a' and  $mode ne 'd' )
+            or ($mode eq 'a' and ($cname_count < 0 or $cname_count > $cname_count_max))
+            or ($mode eq 'd' and ($cname_count < 0 or $cname_count > $cname_count_max))
+        ){
+            $rcode = "REFUSED";
+            $log->info("[nameserver] $peerhost refused $qname $qclass $qtype");
+        }
+        else{
+            my $redis_server_address = $redis_selector->lookup($guid);
+            $log->debug("[redis-selector] $guid $redis_server_address");
+            my $redis = $redis_pool{$redis_server_address} || Redis::Fast->new(substr($redis_server_address,0,1) eq '/'?"sock":"server" => $redis_server_address,encoding => undef,debug=>0,reconnect=>3,every=>1000);
+            $redis->sadd($redis_namespace . $guid, time . '|' . $peerhost);
+            $log->debug("[redis] sadd $guid " . time . '|' . $peerhost);
+            $redis->expire($redis_namespace . $guid, $redis_expire);
+            $log->debug("[redis] expire $guid $redis_expire");
+            if($cname_count >1 ){
+                my $random_string = lc Data::Random::String->create_random_string(
+                    length      =>  $random_string_length,
+                    contains    =>  'alphanumeric') . 
+                    $mode . 
+                    ($cname_count-1)
+                ;
+                my ($ttl, $rdata) = (0, $random_string . $guid . '.' . $auth_domain);
+                @ans = ( new Net::DNS::RR("$qname $ttl $qclass CNAME $rdata") );
+                $rcode = "NOERROR";
+                $log->info("[nameserver] $peerhost answer $qname $qclass $qtype $rdata");
+            } 
+
+            elsif($cname_count <= 1){
+                if($mode eq 'a'){
+                    @ans = map { Net::DNS::RR->new("$qname 0 $qclass $qtype $_")} @nameservers;   
+                    $rcode = "NOERROR";
+                    $log->info("[nameserver] $peerhost answer $qname $qclass $qtype " . join ',',@nameservers);
+                } 
+                elsif($mode eq 'd'){
+                    my @set = $redis->smembers($redis_namespace . $guid);
+                    $log->debug("[redis] smembers $guid " . join(",",@set));
+                    #$redis->del($redis_namespace . $guid);
+                    #$log->debug("[redis] del $guid");
+                    my @dns = keys %{ {map { $_ => undef } map {(split /\|/)[1]} @set} } ;
+                    @ans = map {new Net::DNS::RR("$qname 0 $qclass $qtype $_")} @dns;
+                    $rcode = "NOERROR";
+                    $log->info("[nameserver] $peerhost answer $qname $qclass $qtype " . join(',',@dns));
+                }
+            }
+        }
+    }
+
+    elsif($qtype eq 'A'  and $qname eq 'ns1.' . $auth_domain){
+        @ans = map { Net::DNS::RR->new("$qname 300 $qclass $qtype $_")} @nameservers;
+        $rcode = "NOERROR";
+        $log->info("[nameserver] $peerhost answer $qname $qclass $qtype " . join ',',@nameservers);
+    }
+    elsif($qtype eq 'A' and $qname eq $auth_domain){
+        @ans = (Net::DNS::RR->new("$qname 3600 $qclass SOA  $qname. $auth_email. 20151130 36000 3000 3600000 3600"));
+        $rcode = "NOERROR";
+        $log->info("[nameserver] $peerhost answer $qname $qclass $qtype $qname 3600 $qclass SOA  $qname. $auth_email. 20151130 36000 3000 3600000 3600");
+    }
+    elsif($qtype eq 'AAAA'){$rcode = "NOERROR";$log->info("[nameserver] $peerhost answer $qname $qclass $qtype -");}
+    else{$rcode = "REFUSED";$log->info("[nameserver] $peerhost refused $qname $qclass $qtype");}
+    return ($rcode, \@ans, \@auth, \@add, { aa => 1 , ra=> 0})
+}
+
+my $nameserver = new Net::DNS::Nameserver(
+    LocalAddr => [@bind_ips],
+    LocalPort => $config->{nameserver}{port} || 53,
+    ReplyHandler => \&dns_reply_handler,
+    Verbose      => 0,
+    Truncate     => 0,
+    IdleTimeout  => 30,
+);
+my $master_pid = $$;
+my %workers;
+$SIG{'CHLD'}='IGNORE';
+$SIG{'TERM'}  = $SIG{'HUP'} = sub{
+    exit if $$ != $master_pid;
+    for my $worker_pid (keys %workers){
+        kill 15,$worker_pid;
+    }
+    exit;
+};
+while($$ == $master_pid){
+    for my $worker_pid (keys %workers){
+        unless(kill 0=> $worker_pid){
+            delete $workers{$worker_pid};
+        }
+    }
+    if(scalar(keys %workers) < $workers){
+        my $pid = fork;
+        if($pid ==0){
+            %redis_pool = map{$_ => Redis::Fast->new(substr($_,0,1) eq '/'?"sock":"server" => $_,encoding => undef,debug=>0,reconnect=>3,every=>1000) } @redis_servers;
+            $nameserver->main_loop();
+            exit;
+        }
+        else{
+            $workers{$pid} = 1;
+        }
+    }
+    sleep 2;
+}
+

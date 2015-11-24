@@ -1,0 +1,87 @@
+use strict;
+use warnings;
+use POSIX qw(strftime);
+use Algorithm::ConsistentHash::CHash;
+use Redis::Fast;
+use Data::Random::String ();
+#use Data::GUID qw(guid_string);
+use Mojolicious::Lite;
+use Mojo::JSON qw(encode_json);
+
+app->log->format(sub{
+    my ($time, $level, @lines) = @_;
+    return join ('\n',map {strftime("%Y/%m/%d %H:%M:%S",localtime()) . " [$level] [webserver] $_"} @lines) . "\n";
+});
+my $config = plugin Config => {file => $ARGV[0] // $ENV{MOJO_CONFIG} // './dnsexpose.conf'};
+app->log->level($config->{log_level} // 'info',);
+if(defined $config->{log_path}){
+    if(open my $file,">>",$config->{log_path} ){app->log->path($config->{log_path});app->log->handle($file);}
+    else{die "Can't open log file $config->{log_path}: $!\n";}
+}
+plugin AccessLog => {log => sub {chomp($_[0]);app->log->info($_[0]);}, format => '%h %l %u %t "%r" %>s %b %D "%{Referer}i" "%{User-Agent}i"' } ;
+
+my $auth_domain = $config->{nameserver}{auth_domain};
+my $api_domain = 'tools.' . $auth_domain;
+my $guid_length = $config->{guid_length};
+my $random_string_length = $config->{random_string_length};
+my @redis_servers = @{$config->{redis}{server}} or die "redis server must be set\n";
+my %redis_pool = map{$_ => Redis::Fast->new(substr($_,0,1) eq '/'?"sock":"server" => $_,encoding => undef,debug=>0,reconnect=>3,every=>1000) } @redis_servers;
+my $redis_selector = Algorithm::ConsistentHash::CHash->new(ids=>[@redis_servers],replicas=>1000);
+
+my $redis_namespace = $config->{redis}{namespace} // 'dnsexpose::';
+my $redis_expire = $config->{redis}{expire} // 60;
+
+app->config(hypnotoad => $config->{webserver});
+
+helper gen_domain => sub {
+    my $c = shift;
+    my $guid = lc Data::Random::String->create_random_string(length=>$guid_length,contains=>'alphanumeric');
+    my $random_string = lc Data::Random::String->create_random_string(length=>$random_string_length,contains=>'alphanumeric') . 'a1' ;
+    return $random_string . $guid . '.' . $auth_domain;
+};
+
+helper handle_request => sub{
+    my $c = shift;
+    my $host = $c->req->url->to_abs->host;
+    if($host eq $api_domain){
+        my $domain = $c->gen_domain();
+        my $url = $c->req->url->to_abs;
+        $url->host($domain);
+        $c->res->headers->location($url);
+        $c->rendered(302);
+        return ;
+    }
+    elsif($host =~ /([a-z0-9]{$random_string_length})(a)(\d)([a-z0-9]{$guid_length})\.\Q$auth_domain\E/){
+        my ($random_string,$mode,$rewrite_count,$guid) = ($1,$2,$3,$4); 
+        if($mode ne 'a'){$c->rendered(403);return}
+        my $redis_server_address = $redis_selector->lookup($guid);
+        my $redis = $redis_pool{$redis_server_address} || Redis::Fast->new(substr($redis_server_address,0,1) eq '/'?"sock":"server" => $redis_server_address,encoding => undef,debug=>0,reconnect=>3,every=>1000); 
+        my @set = $redis->smembers($redis_namespace . $guid);
+        my @dns = keys %{ {map { $_ => undef } map {(split /\|/)[1]} @set} } ;
+        return @dns;
+    }
+    else{
+        $c->rendered(403);return ;
+    }
+};
+
+under sub {
+    my $c = shift;
+    $c->res->headers->server("dnsexpose server");
+    return 1;
+};
+
+get '/api/json' => sub {
+    my $c = shift;
+    my @dns = $c->handle_request();
+    my $remoteip = $c->tx->remote_address;
+    $c->render(json=>{dnsinfo=>\@dns,remoteip=>$remoteip}) if @dns;
+};
+get '/api/jsonp' => sub {
+    my $c = shift;
+    my @dns = $c->handle_request();
+    my $remoteip = $c->tx->remote_address;
+    my $jsoncallback = $c->param("jsoncallback") // '';
+    $c->render(text=>$jsoncallback . '(' . encode_json({dnsinfo=>\@dns,remoteip=>$remoteip}) . ')') if @dns;
+};
+app->start;
